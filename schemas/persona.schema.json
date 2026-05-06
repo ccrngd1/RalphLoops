@@ -1,0 +1,98 @@
+{
+  "$defs": {
+    "ToolRestrictions": {
+      "description": "Optional allow/disallow lists scoping the tools a persona may use.",
+      "properties": {
+        "allow": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allow"
+        },
+        "disallow": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Disallow"
+        }
+      },
+      "title": "ToolRestrictions",
+      "type": "object"
+    }
+  },
+  "description": "A parsed persona definition (R3.2, R3.3).\n\n``prompt_template`` supports the placeholder set documented in R3.7\n(``{{project_brief}}``, ``{{task_spec}}``, ``{{task_id}}``,\n``{{task_title}}``, ``{{persona_name}}``).\n``default_persona_review_pass_condition`` supplies the fallback pass\ncondition when a ``persona_review`` check omits one (R7.7).",
+  "properties": {
+    "default_persona_review_pass_condition": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Default Persona Review Pass Condition"
+    },
+    "description": {
+      "title": "Description",
+      "type": "string"
+    },
+    "instructions": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Instructions"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "prompt_template": {
+      "title": "Prompt Template",
+      "type": "string"
+    },
+    "tool_restrictions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolRestrictions"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "name",
+    "description",
+    "prompt_template"
+  ],
+  "title": "Persona",
+  "type": "object"
+}
