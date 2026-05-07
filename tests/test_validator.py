@@ -104,12 +104,14 @@ def _make_task(**overrides: Any) -> Task:
 def _make_spec(
     *,
     checks: list[Any] | None = None,
+    context_files: list[str] | None = None,
 ) -> TaskSpec:
     return TaskSpec(
         id="T1",
         title="Draft chapter",
         validation=checks
         or [ShellCheckConfig(type="shell", name="noop", commands=[_cmd_exit_zero()])],
+        context_files=context_files,
         body=TaskSpecBody(
             objective="Write chapter one.",
             context_references="outline v1",
@@ -375,6 +377,159 @@ class TestPersonaReviewCheck:
         invoker.invoke.assert_not_called()
         messages = [r.getMessage() for r in caplog.records]
         assert any("Self-review" in m for m in messages)
+
+    async def test_self_review_with_fallback_substitutes_reviewer(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """R7.9 + escalation recovery: when the reviewer matches the
+        executing persona AND a distinct fallback_reviewer is
+        configured, the validator swaps in the fallback so the task
+        can still make progress out of the stuck state."""
+        writer = _make_persona("Writer", default_pass="no critical issues")
+        reviewer = _make_persona("Reviewer", default_pass="no critical issues")
+        registry = _make_registry([writer, reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Writer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=json.dumps({"verdict": "pass", "rationale": "ok"})
+        )
+
+        with caplog.at_level(logging.WARNING, logger="ralph_loop.validator"):
+            result = await _run_persona_review_check(
+                check,
+                task=_make_task(),
+                spec=_make_spec(),
+                executing_persona_name="Writer",
+                registry=registry,
+                invoker=invoker,
+                log_path=tmp_path / "review.log",
+                default_timeout_ms=60_000,
+                fallback_reviewer="Reviewer",
+            )
+
+        assert result.verdict == "pass"
+        # The invoker WAS called with the substitute reviewer.
+        invoker.invoke.assert_awaited_once()
+        # The fallback substitution is logged as a warning.
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "substituting fallback reviewer 'Reviewer'" in m for m in messages
+        )
+
+    async def test_self_review_with_matching_fallback_still_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """When fallback_reviewer equals the executing persona too (i.e. the
+        executing persona IS the fallback), no substitution is possible
+        and the check must fail rather than recurse into self-review."""
+        writer = _make_persona("Writer", default_pass="no critical issues")
+        registry = _make_registry([writer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Writer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+            fallback_reviewer="Writer",  # same as executing, can't substitute
+        )
+
+        assert result.verdict == "fail"
+        invoker.invoke.assert_not_called()
+
+    async def test_context_files_are_inlined_into_review_prompt(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Reviewer sees the actual file contents regardless of its cwd
+        (fixes the 'No preface artifact was found' scenario)."""
+        (tmp_path / "chapter02-preface.md").write_text(
+            "Chapter 2 preface body.", encoding="utf-8"
+        )
+        writer = _make_persona("Writer", default_pass="present")
+        reviewer = _make_persona("Reviewer", default_pass="present")
+        registry = _make_registry([writer, reviewer])
+
+        # Spec declares context_files that should be inlined.
+        spec = _make_spec(
+            context_files=["chapter02-preface.md"],
+        )
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer",
+            pass_condition="preface is present",
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=json.dumps({"verdict": "pass", "rationale": "file inlined"})
+        )
+
+        await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=spec,
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+            cwd=tmp_path,
+        )
+
+        # The prompt piped to Kiro CLI contained the file's contents.
+        invoker.invoke.assert_awaited_once()
+        passed_context = invoker.invoke.call_args.kwargs["context"]
+        assert "Chapter 2 preface body." in passed_context
+        assert "chapter02-preface.md" in passed_context
+        # And the cwd was forwarded so the reviewer's own tools resolve
+        # from the project root, not ralph-loop's source tree.
+        assert invoker.invoke.call_args.kwargs["cwd"] == tmp_path
+
+    async def test_missing_context_file_is_noted_not_fatal(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A declared context_file that doesn't exist on disk is marked
+        MISSING in the prompt but does not fail the check."""
+        writer = _make_persona("Writer", default_pass="present")
+        reviewer = _make_persona("Reviewer", default_pass="present")
+        registry = _make_registry([writer, reviewer])
+        spec = _make_spec(context_files=["does-not-exist.md"])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer",
+            pass_condition="ok",
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=json.dumps({"verdict": "pass", "rationale": "noted"})
+        )
+
+        await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=spec,
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+            cwd=tmp_path,
+        )
+
+        passed_context = invoker.invoke.call_args.kwargs["context"]
+        assert "MISSING" in passed_context
+        assert "does-not-exist.md" in passed_context
 
     async def test_missing_reviewing_persona_raises_stuck(
         self, tmp_path: Path

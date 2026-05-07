@@ -338,6 +338,7 @@ async def _run_loop(config: Config, project_root: Path) -> int:
         invoker=invoker,
         registry=registry,
         model_id=config.default_model_id,
+        fallback_reviewer=config.fallback_persona,
     )
     accountant = TokenAccountant(config)
     git_mgr = GitManager(

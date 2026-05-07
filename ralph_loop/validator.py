@@ -312,15 +312,22 @@ def _build_review_prompt(
     task: Task,
     spec: TaskSpec,
     pass_condition: str,
+    inlined_context: str = "",
+    cwd_note: str = "",
 ) -> str:
     """Build the prompt for a ``persona_review`` invocation (R7.9).
 
-    The prompt is intentionally minimal:
+    The prompt:
 
     * Identifies the reviewing persona by name.
     * States the resolved pass condition.
     * Includes the task id and title plus the spec body's objective
       and instructions as review artifacts.
+    * Inlines the contents of every ``context_files`` path declared
+      on the spec, so the reviewer can judge content quality even if
+      the reviewer's filesystem tools resolve against the wrong cwd.
+    * Tells the reviewer where the project root is, so any file tool
+      calls use absolute paths rather than ralph-loop's own source tree.
     * Asks for a strict JSON verdict of the form
       ``{"verdict": "pass"|"fail", "rationale": "..."}``.
 
@@ -332,20 +339,27 @@ def _build_review_prompt(
     eliminates the risk of recursive review chains (R7.9 note on
     recursion safety in design.md).
     """
-    return (
+    parts = [
         f"You are the reviewing persona {reviewing_persona.name!r}. Review the "
         "following task artifacts and return a strict JSON decision of the form "
         '{"verdict": "pass"|"fail", "rationale": "<brief text>"}. '
-        "Do not include any additional text or code fences outside the JSON object.\n"
-        f"\nPass condition: {pass_condition}\n"
-        "\n## Task\n"
-        f"id: {task.id}\n"
-        f"title: {task.title}\n"
-        "\n## Task Spec Objective\n"
-        f"{spec.body.objective}\n"
-        "\n## Task Spec Instructions\n"
-        f"{spec.body.instructions}\n"
-    )
+        "Do not include any additional text or code fences outside the JSON object.\n",
+    ]
+    if cwd_note:
+        parts.append(f"\n{cwd_note}\n")
+    parts.append(f"\nPass condition: {pass_condition}\n")
+    parts.append("\n## Task\n")
+    parts.append(f"id: {task.id}\n")
+    parts.append(f"title: {task.title}\n")
+    parts.append("\n## Task Spec Objective\n")
+    parts.append(f"{spec.body.objective}\n")
+    parts.append("\n## Task Spec Instructions\n")
+    parts.append(f"{spec.body.instructions}\n")
+    if inlined_context:
+        parts.append("\n## Context Files (inlined for review)\n\n")
+        parts.append(inlined_context)
+        parts.append("\n")
+    return "".join(parts)
 
 
 async def _run_persona_review_check(
@@ -359,6 +373,8 @@ async def _run_persona_review_check(
     log_path: Path,
     default_timeout_ms: int,
     model_id: Optional[str] = None,
+    cwd: Optional[Path] = None,
+    fallback_reviewer: Optional[str] = None,
 ) -> CheckResult:
     """Run a ``persona_review`` check (R7.3, R7.6-R7.10, R7.13).
 
@@ -396,24 +412,51 @@ async def _run_persona_review_check(
             "registry for persona_review check",
         )
 
-    # --- Self-review guard (design.md §Validator recursion safety) ----
+    # --- Self-review handling (design.md §Validator recursion safety) --
+    # R7.9 recursion safety: a persona cannot review its own iteration.
+    # The canonical case where this trips is escalation: the escalation
+    # persona runs the iteration AND is the declared reviewer. Rather
+    # than fail the check and force the task into a retry loop that can
+    # never pass, swap in ``fallback_reviewer`` (the configured
+    # ``fallback_persona``) as the substitute reviewer and log a
+    # warning. If no substitute is available, we still have to fail so
+    # no persona ends up reviewing its own output.
     if check.persona == executing_persona_name:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        msg = (
-            f"Self-review rejected: reviewing persona {check.persona!r} "
-            "matches the executing persona; a persona cannot review its "
-            "own iteration"
+        substitute_name: Optional[str] = None
+        if (
+            fallback_reviewer
+            and fallback_reviewer != executing_persona_name
+            and registry.get(fallback_reviewer) is not None
+        ):
+            substitute_name = fallback_reviewer
+
+        if substitute_name is None:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            msg = (
+                f"Self-review rejected: reviewing persona {check.persona!r} "
+                "matches the executing persona, and no distinct "
+                "fallback_persona is available to substitute"
+            )
+            logger.error(msg)
+            return CheckResult(
+                type="persona_review",
+                name=name,
+                verdict="fail",
+                output=msg,
+                reviewing_persona=check.persona,
+                duration_ms=duration_ms,
+                timed_out=False,
+            )
+
+        logger.warning(
+            "persona_review check %r: reviewing persona %r equals "
+            "executing persona; substituting fallback reviewer %r",
+            name, check.persona, substitute_name,
         )
-        logger.error(msg)
-        return CheckResult(
-            type="persona_review",
-            name=name,
-            verdict="fail",
-            output=msg,
-            reviewing_persona=check.persona,
-            duration_ms=duration_ms,
-            timed_out=False,
-        )
+        reviewing_persona = registry.get(substitute_name)
+        # ``registry.get`` is truthy here because we gated on it above,
+        # but mypy wants the narrowing.
+        assert reviewing_persona is not None
 
     # --- Pass-condition resolution (R7.6, R7.7, R7.8) -----------------
     pass_condition = resolve_pass_condition(check, reviewing_persona)
@@ -426,11 +469,48 @@ async def _run_persona_review_check(
         )
 
     # --- Invoke reviewing persona (R7.9) ------------------------------
+    # Inline declared context_files so the reviewer sees content even if
+    # its own filesystem tools resolve against an unexpected cwd. Missing
+    # files are logged and skipped; a read failure never aborts the check.
+    inlined_context = ""
+    if spec.context_files:
+        parts: list[str] = []
+        for rel_path in spec.context_files:
+            abs_path = (
+                (cwd / rel_path) if cwd is not None else Path(rel_path)
+            )
+            try:
+                if abs_path.is_file():
+                    body = abs_path.read_text(encoding="utf-8")
+                    parts.append(f"### File: {rel_path}\n\n{body}\n")
+                else:
+                    parts.append(
+                        f"### File: {rel_path}\n\n"
+                        f"[MISSING: {abs_path} does not exist]\n"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                parts.append(
+                    f"### File: {rel_path}\n\n"
+                    f"[READ ERROR: {exc}]\n"
+                )
+        inlined_context = "\n".join(parts)
+
+    cwd_note = (
+        f"The project root is {cwd}. Resolve any file references below "
+        "relative to that path. The content of every declared "
+        "``context_files`` entry is inlined below; prefer that inline "
+        "content over filesystem lookups."
+        if cwd is not None
+        else ""
+    )
+
     prompt = _build_review_prompt(
         reviewing_persona=reviewing_persona,
         task=task,
         spec=spec,
         pass_condition=pass_condition,
+        inlined_context=inlined_context,
+        cwd_note=cwd_note,
     )
     timeout_ms = (
         check.timeout_ms if check.timeout_ms is not None else default_timeout_ms
@@ -442,6 +522,7 @@ async def _run_persona_review_check(
             call_kind="persona_review",
             timeout_ms=timeout_ms,
             model_id=model_id,
+            cwd=cwd,
         )
     except KiroInvocationTimeout:
         duration_ms = int((time.monotonic() - start) * 1000)
@@ -526,10 +607,12 @@ class Validator:
         invoker: KiroInvoker,
         registry: PersonaRegistry,
         model_id: Optional[str] = None,
+        fallback_reviewer: Optional[str] = None,
     ) -> None:
         self._invoker = invoker
         self._registry = registry
         self._model_id = model_id
+        self._fallback_reviewer = fallback_reviewer
 
     async def run(
         self,
@@ -599,6 +682,8 @@ class Validator:
                     log_path=log_path,
                     default_timeout_ms=default_timeout_ms,
                     model_id=self._model_id,
+                    cwd=cwd,
+                    fallback_reviewer=self._fallback_reviewer,
                 )
             else:  # pragma: no cover - defensive: union is closed
                 raise AssertionError(f"unknown check type: {type(check)!r}")
