@@ -415,3 +415,277 @@ class TestProperty15TimeoutHandling:
         assert result.verdict == "pass"
         assert result.timed_out is False
         assert fake.killed is False
+
+
+# ---------------------------------------------------------------------------
+# Property 16: bug-condition exploration — verdict recovered from envelopes
+# ---------------------------------------------------------------------------
+
+
+class TestProperty16VerdictRecovery:
+    """Validates: bugfix requirements 2.1, 2.2, 2.3, 2.4, 2.5.
+
+    Fix-checking property for the ``persona-review-verdict-parsing``
+    bugfix (see ``.kiro/specs/persona-review-verdict-parsing/``). Given
+    a valid ``PersonaReviewVerdict`` payload wrapped inside any
+    combination of: a markdown code fence, a leading tool-use JSON
+    envelope, and surrounding prose, the fixed pipeline
+    (:func:`ralph_loop.json_extract.extract_validating_object`) MUST
+    recover the original payload.
+
+    This property is EXPECTED TO FAIL on unfixed code (the shared
+    helper module does not exist yet or the extractor cannot handle
+    fences / leading envelopes / embedded braces). Failure is the
+    signal that confirms the bug exists. After the fix lands, this
+    property flips to passing.
+    """
+
+    @given(
+        verdict=st.sampled_from(["pass", "fail"]),
+        rationale=st.text(
+            alphabet=st.characters(
+                blacklist_categories=("Cs",),
+                blacklist_characters="\x00",
+            ),
+            max_size=200,
+        ),
+        use_fence=st.booleans(),
+        lang_tag=st.sampled_from(["", "json", "JSON"]),
+        prepend_tool_use=st.booleans(),
+        leading_prose=st.text(max_size=50),
+        trailing_prose=st.text(max_size=50),
+    )
+    @settings(
+        max_examples=200,
+        suppress_health_check=[HealthCheck.too_slow],
+        deadline=None,
+    )
+    def test_verdict_recovered_from_any_legitimate_envelope(
+        self,
+        verdict: str,
+        rationale: str,
+        use_fence: bool,
+        lang_tag: str,
+        prepend_tool_use: bool,
+        leading_prose: str,
+        trailing_prose: str,
+    ) -> None:
+        """Fixed extractor recovers the embedded verdict from any envelope.
+
+        Assembly order matches design.md §Testing Strategy §Fix
+        Checking: optional leading prose, optional leading tool-use
+        JSON envelope, body either bare or wrapped in a
+        ``\u0060\u0060\u0060<lang>\n...\n\u0060\u0060\u0060`` fence,
+        optional trailing prose. The body is ``json.dumps(payload)`` so
+        JSON escaping is handled by the standard library.
+        """
+        import json as _json
+
+        # Import here so the ImportError on unfixed code is captured by
+        # the test runner rather than by collection. This is also the
+        # recommended pattern when a property depends on a module that
+        # does not yet exist.
+        from ralph_loop.json_extract import extract_validating_object
+        from ralph_loop.validator import PersonaReviewVerdict
+
+        payload = {"verdict": verdict, "rationale": rationale}
+        body = _json.dumps(payload)
+
+        segments: list[str] = []
+        if leading_prose:
+            segments.append(leading_prose)
+        if prepend_tool_use:
+            segments.append(
+                '{"tool":"read_file","args":{"path":"x"}}'
+            )
+        if use_fence:
+            segments.append(f"```{lang_tag}\n{body}\n```")
+        else:
+            segments.append(body)
+        if trailing_prose:
+            segments.append(trailing_prose)
+        stdout = "\n".join(segments)
+
+        recovered = extract_validating_object(stdout, PersonaReviewVerdict)
+        assert recovered is not None, (
+            f"extract_validating_object returned None for stdout={stdout!r}"
+        )
+        assert recovered.verdict == verdict
+        assert recovered.rationale == rationale
+
+
+# ---------------------------------------------------------------------------
+# Preservation fixture: pinned copy of the pre-fix naive extractor
+# ---------------------------------------------------------------------------
+
+
+def _extract_first_json_object_naive(text: str) -> Optional[str]:
+    """Pinned copy of the original naive extractor from pre-fix validator.py.
+
+    This is a verbatim copy of ``_extract_first_json_object`` as it
+    existed before the ``persona-review-verdict-parsing`` bugfix. It
+    lives here so Properties 18 and 19 can compare the fixed pipeline
+    against the original naive behavior even after the production
+    helpers were deleted.
+
+    The naive extractor performs a simple brace-matching scan that does
+    NOT track JSON string state or escape state. It returns the first
+    balanced ``{...}`` substring or ``None`` when no opening brace is
+    present / every opening brace is unbalanced.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Property 18: preservation — PersonaReviewVerdict happy path matches naive
+# ---------------------------------------------------------------------------
+
+
+class TestProperty18PreservationPersonaReview:
+    """Validates: bugfix requirements 3.1, 3.2.
+
+    Preservation property for the ``persona-review-verdict-parsing``
+    bugfix. For any ``stdout`` consisting of a single flat
+    ``json.dumps({"verdict": ..., "rationale": ...})`` — the "happy
+    path" subset where ``isBugCondition`` is false — the fixed pipeline
+    MUST produce exactly the same outcome as the naive pipeline.
+
+    Passes on fixed code; would also pass on unfixed code by
+    construction (the fixed pipeline is a conservative extension).
+    Property 18 locks in the happy-path behavior so a future edit that
+    accidentally changes it would be caught.
+    """
+
+    @given(
+        verdict=st.sampled_from(["pass", "fail"]),
+        rationale=st.text(max_size=100),
+    )
+    @settings(
+        max_examples=200,
+        suppress_health_check=[HealthCheck.too_slow],
+        deadline=None,
+    )
+    def test_happy_path_matches_naive_pipeline(
+        self, verdict: str, rationale: str
+    ) -> None:
+        """Fixed extractor agrees with naive pipeline on flat JSON dumps.
+
+        Preservation semantics: WHERE the naive pipeline successfully
+        produced a model, the fixed pipeline MUST produce an equal
+        model. The converse does NOT hold — the fix legitimately
+        recovers verdicts from inputs that defeated the naive scanner
+        (e.g. a rationale string containing a literal ``{``). Those
+        cases fall under Property 16 / the bugfix and are excluded
+        here via ``assume``.
+        """
+        from hypothesis import assume
+        import json as _json
+
+        from pydantic import ValidationError as _PydValidationError
+
+        from ralph_loop.json_extract import extract_validating_object
+        from ralph_loop.validator import PersonaReviewVerdict
+
+        payload = {"verdict": verdict, "rationale": rationale}
+        stdout = _json.dumps(payload)
+
+        # Naive pipeline (pre-fix behavior).
+        naive_sub = _extract_first_json_object_naive(stdout)
+        naive_model: Optional[PersonaReviewVerdict] = None
+        if naive_sub is not None:
+            try:
+                naive_model = PersonaReviewVerdict.model_validate(
+                    _json.loads(naive_sub)
+                )
+            except (_json.JSONDecodeError, _PydValidationError):
+                naive_model = None
+
+        # Preservation claim: wherever naive produced a model, fixed
+        # agrees. Where naive returned None the fix may legitimately
+        # recover a model (Property 16 territory) — skip those examples.
+        assume(naive_model is not None)
+
+        fixed_model = extract_validating_object(
+            stdout, PersonaReviewVerdict
+        )
+        assert fixed_model == naive_model
+
+
+# ---------------------------------------------------------------------------
+# Property 19: preservation — OrchestratorDecision happy path matches naive
+# ---------------------------------------------------------------------------
+
+
+class TestProperty19PreservationOrchestratorDecision:
+    """Validates: bugfix requirement 3.5.
+
+    Preservation property mirroring Property 18 for
+    :class:`OrchestratorDecision`. For any ``raw`` consisting of a
+    single flat ``json.dumps({"persona": ..., "rationale": ...})``
+    (the happy path the Orchestrator actually fed through
+    ``_parse_decision`` before the fix), the fixed pipeline MUST
+    produce exactly the same :class:`OrchestratorDecision` as the
+    naive pipeline.
+    """
+
+    @given(
+        persona=st.text(
+            alphabet=string.ascii_letters + string.digits + "_-",
+            min_size=1,
+            max_size=20,
+        ),
+        rationale=st.text(max_size=100),
+    )
+    @settings(
+        max_examples=200,
+        suppress_health_check=[HealthCheck.too_slow],
+        deadline=None,
+    )
+    def test_happy_path_matches_naive_pipeline(
+        self, persona: str, rationale: str
+    ) -> None:
+        """Fixed extractor agrees with naive pipeline on flat orchestrator JSON.
+
+        Same preservation semantics as Property 18: wherever the naive
+        pipeline produced an :class:`OrchestratorDecision`, the fixed
+        pipeline MUST produce an equal one. Inputs that defeated the
+        naive scanner (e.g. a rationale containing ``{``) are excluded
+        via ``assume`` — those are Property 17 territory.
+        """
+        from hypothesis import assume
+        import json as _json
+
+        from pydantic import ValidationError as _PydValidationError
+
+        from ralph_loop.json_extract import extract_validating_object
+        from ralph_loop.orchestrator import OrchestratorDecision
+
+        payload = {"persona": persona, "rationale": rationale}
+        raw = _json.dumps(payload)
+
+        naive_sub = _extract_first_json_object_naive(raw)
+        naive_model: Optional[OrchestratorDecision] = None
+        if naive_sub is not None:
+            try:
+                naive_model = OrchestratorDecision.model_validate(
+                    _json.loads(naive_sub)
+                )
+            except (_json.JSONDecodeError, _PydValidationError):
+                naive_model = None
+
+        assume(naive_model is not None)
+
+        fixed_model = extract_validating_object(raw, OrchestratorDecision)
+        assert fixed_model == naive_model

@@ -34,15 +34,15 @@ Two pure helpers are exposed for property-based testing:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import shlex
 import time
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from ralph_loop.json_extract import extract_validating_object
 from ralph_loop.kiro import KiroInvocationTimeout, KiroInvoker
 from ralph_loop.models import (
     CheckResult,
@@ -140,30 +140,6 @@ def resolve_pass_condition(
         return check.pass_condition
     return reviewing_persona.default_persona_review_pass_condition
 
-
-
-def _extract_first_json_object(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` substring in ``text``, or ``None``.
-
-    The reviewing persona may wrap its verdict JSON in prose. This
-    helper performs a brace-matching scan identical in spirit to the
-    one in :mod:`ralph_loop.orchestrator`; it ignores quoting and
-    escapes, which is sufficient for the flat verdict shape documented
-    in R7.9.
-    """
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
 
 
 async def _run_shell_check(
@@ -543,14 +519,14 @@ async def _run_persona_review_check(
         )
 
     # --- Parse the reviewing persona's verdict (R7.9, R7.10) ----------
-    json_text = _extract_first_json_object(invocation.stdout)
-    parsed_verdict: Optional[PersonaReviewVerdict] = None
-    if json_text is not None:
-        try:
-            payload = json.loads(json_text)
-            parsed_verdict = PersonaReviewVerdict.model_validate(payload)
-        except (json.JSONDecodeError, ValidationError):
-            parsed_verdict = None
+    # Delegates to the shared helper so fences, leading tool-use JSON
+    # envelopes, braces inside rationale strings, and escaped quotes
+    # are all handled uniformly (see
+    # ``.kiro/specs/persona-review-verdict-parsing/`` and
+    # :mod:`ralph_loop.json_extract`).
+    parsed_verdict = extract_validating_object(
+        invocation.stdout, PersonaReviewVerdict
+    )
 
     duration_ms = int((time.monotonic() - start) * 1000)
     if parsed_verdict is None:

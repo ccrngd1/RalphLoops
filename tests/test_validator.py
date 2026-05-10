@@ -637,6 +637,154 @@ class TestPersonaReviewCheck:
         assert result.verdict == "pass"
         assert result.rationale == "looks good"
 
+    # ------------------------------------------------------------------
+    # Bugfix regression tests for `persona-review-verdict-parsing`
+    # (scenarios 1.1–1.5 from design.md).
+    # ------------------------------------------------------------------
+
+    async def test_verdict_in_markdown_fence_is_parsed(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.1: reviewer wraps verdict in ```json ... ``` fence."""
+        reviewer = _make_persona("Reviewer", default_pass="no issues")
+        registry = _make_registry([_make_persona("Writer"), reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout='```json\n{"verdict": "pass", "rationale": "ok"}\n```'
+        )
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+        )
+        assert result.verdict == "pass"
+        assert result.rationale == "ok"
+
+    async def test_leading_tool_use_envelope_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.2: tool-use JSON precedes the actual verdict."""
+        reviewer = _make_persona("Reviewer", default_pass="no issues")
+        registry = _make_registry([_make_persona("Writer"), reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=(
+                '{"tool":"read_file","args":{"path":"x"}}\n'
+                '{"verdict":"pass","rationale":"ok"}'
+            )
+        )
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+        )
+        assert result.verdict == "pass"
+        assert result.rationale == "ok"
+
+    async def test_literal_close_brace_in_rationale_is_parsed(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.3: rationale string contains a literal ``}``."""
+        reviewer = _make_persona("Reviewer", default_pass="no issues")
+        registry = _make_registry([_make_persona("Writer"), reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout='{"verdict":"fail","rationale":"missing } in expression"}'
+        )
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+        )
+        assert result.verdict == "fail"
+        assert result.rationale == "missing } in expression"
+
+    async def test_escaped_quotes_around_brace_in_rationale(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.4: rationale contains escaped quotes around a brace."""
+        reviewer = _make_persona("Reviewer", default_pass="no issues")
+        registry = _make_registry([_make_persona("Writer"), reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        # The raw JSON source: {"verdict":"fail","rationale":"saw \"{\" unexpected"}
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=r'{"verdict":"fail","rationale":"saw \"{\" unexpected"}'
+        )
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+        )
+        assert result.verdict == "fail"
+        assert result.rationale == 'saw "{" unexpected'
+
+    async def test_multiple_objects_verdict_is_not_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.5: multiple JSON objects, verdict is not the first."""
+        reviewer = _make_persona("Reviewer", default_pass="no issues")
+        registry = _make_registry([_make_persona("Writer"), reviewer])
+        check = PersonaReviewCheckConfig(
+            type="persona_review", persona="Reviewer"
+        )
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=(
+                '{"progress":1}\n'
+                '{"tool":"read_file","args":{}}\n'
+                '{"verdict":"pass","rationale":"ok"}'
+            )
+        )
+
+        result = await _run_persona_review_check(
+            check,
+            task=_make_task(),
+            spec=_make_spec(),
+            executing_persona_name="Writer",
+            registry=registry,
+            invoker=invoker,
+            log_path=tmp_path / "review.log",
+            default_timeout_ms=60_000,
+        )
+        assert result.verdict == "pass"
+        assert result.rationale == "ok"
+
 
 
 # ---------------------------------------------------------------------------

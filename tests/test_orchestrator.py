@@ -484,3 +484,228 @@ class TestOrchestratorDecision:
         )
         assert decision.persona == "Writer"
         assert decision.rationale == "matches well"
+
+
+# ---------------------------------------------------------------------------
+# Bugfix coverage for `persona-review-verdict-parsing`
+#
+# Property 17: fix-checking for OrchestratorDecision — any legitimate
+# envelope (fence, leading tool-use JSON, embedded braces, escaped
+# quotes in rationale, prose wrapping) MUST still yield the embedded
+# decision after the fix. Plus five regression tests mirroring the
+# validator scenarios 1.1–1.5.
+# ---------------------------------------------------------------------------
+
+
+import string
+
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+
+from ralph_loop.json_extract import extract_validating_object
+
+
+class TestProperty17OrchestratorDecisionRecovery:
+    """Validates: bugfix requirements 2.1, 2.2, 2.3, 2.4, 2.5, 3.5.
+
+    Fix-checking property mirroring Property 16 for
+    :class:`OrchestratorDecision`. Given any valid decision payload
+    wrapped in any combination of markdown fence, leading tool-use
+    JSON envelope, and surrounding prose, the fixed pipeline MUST
+    recover it.
+
+    Expected to fail on unfixed code and pass after the migration of
+    ``Orchestrator._parse_decision``.
+    """
+
+    @given(
+        persona=st.text(
+            alphabet=string.ascii_letters + string.digits + "_-",
+            min_size=1,
+            max_size=20,
+        ),
+        rationale=st.text(
+            alphabet=st.characters(
+                blacklist_categories=("Cs",),
+                blacklist_characters="\x00",
+            ),
+            max_size=200,
+        ),
+        use_fence=st.booleans(),
+        lang_tag=st.sampled_from(["", "json", "JSON"]),
+        prepend_tool_use=st.booleans(),
+        leading_prose=st.text(max_size=50),
+        trailing_prose=st.text(max_size=50),
+    )
+    @settings(
+        max_examples=200,
+        suppress_health_check=[HealthCheck.too_slow],
+        deadline=None,
+    )
+    def test_decision_recovered_from_any_legitimate_envelope(
+        self,
+        persona: str,
+        rationale: str,
+        use_fence: bool,
+        lang_tag: str,
+        prepend_tool_use: bool,
+        leading_prose: str,
+        trailing_prose: str,
+    ) -> None:
+        payload = {"persona": persona, "rationale": rationale}
+        body = json.dumps(payload)
+
+        segments: list[str] = []
+        if leading_prose:
+            segments.append(leading_prose)
+        if prepend_tool_use:
+            segments.append('{"tool":"read_file","args":{"path":"x"}}')
+        if use_fence:
+            segments.append(f"```{lang_tag}\n{body}\n```")
+        else:
+            segments.append(body)
+        if trailing_prose:
+            segments.append(trailing_prose)
+        raw = "\n".join(segments)
+
+        recovered = extract_validating_object(raw, OrchestratorDecision)
+        assert recovered is not None, (
+            f"extract_validating_object returned None for raw={raw!r}"
+        )
+        assert recovered.persona == persona
+        assert recovered.rationale == rationale
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: scenarios 1.1–1.5 against Orchestrator.select_persona
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorVerdictParsingRegression:
+    """Mirrors ``TestPersonaReviewCheck`` scenarios 1.1–1.5 for the
+    orchestrator's decision-parsing path. Each test stubs the Kiro
+    invoker with stdout matching the scenario and asserts the fixed
+    pipeline recovers the expected :class:`OrchestratorDecision`.
+    """
+
+    async def test_decision_in_markdown_fence_is_parsed(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.1: LLM wraps decision in ```json ... ``` fence."""
+        registry = _make_registry([_make_persona("Writer")])
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout='```json\n{"persona": "Writer", "rationale": "ok"}\n```'
+        )
+        orch = Orchestrator(
+            invoker=invoker,
+            log_path=tmp_path / "orch.log",
+            fallback_persona="Writer",
+        )
+
+        selection = await orch.select_persona(
+            task=_make_task(), spec=_make_spec(), registry=registry
+        )
+
+        assert selection.path == "llm"
+        assert selection.persona.name == "Writer"
+        assert selection.rationale == "ok"
+
+    async def test_leading_tool_use_envelope_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.2: tool-use JSON precedes the decision."""
+        registry = _make_registry([_make_persona("Writer")])
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=(
+                '{"tool":"read_file","args":{"path":"x"}}\n'
+                '{"persona":"Writer","rationale":"ok"}'
+            )
+        )
+        orch = Orchestrator(
+            invoker=invoker,
+            log_path=tmp_path / "orch.log",
+            fallback_persona="Writer",
+        )
+
+        selection = await orch.select_persona(
+            task=_make_task(), spec=_make_spec(), registry=registry
+        )
+
+        assert selection.path == "llm"
+        assert selection.persona.name == "Writer"
+        assert selection.rationale == "ok"
+
+    async def test_literal_close_brace_in_rationale_is_parsed(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.3: rationale string contains a literal ``}``."""
+        registry = _make_registry([_make_persona("Writer")])
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout='{"persona":"Writer","rationale":"missing } in expression"}'
+        )
+        orch = Orchestrator(
+            invoker=invoker,
+            log_path=tmp_path / "orch.log",
+            fallback_persona="Writer",
+        )
+
+        selection = await orch.select_persona(
+            task=_make_task(), spec=_make_spec(), registry=registry
+        )
+
+        assert selection.path == "llm"
+        assert selection.persona.name == "Writer"
+        assert selection.rationale == "missing } in expression"
+
+    async def test_escaped_quotes_around_brace_in_rationale(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.4: rationale contains escaped quotes around a brace."""
+        registry = _make_registry([_make_persona("Writer")])
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=r'{"persona":"Writer","rationale":"saw \"{\" unexpected"}'
+        )
+        orch = Orchestrator(
+            invoker=invoker,
+            log_path=tmp_path / "orch.log",
+            fallback_persona="Writer",
+        )
+
+        selection = await orch.select_persona(
+            task=_make_task(), spec=_make_spec(), registry=registry
+        )
+
+        assert selection.path == "llm"
+        assert selection.persona.name == "Writer"
+        assert selection.rationale == 'saw "{" unexpected'
+
+    async def test_multiple_objects_decision_is_not_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Scenario 1.5: multiple JSON objects, decision is not the first."""
+        registry = _make_registry([_make_persona("Writer")])
+        invoker = AsyncMock(spec=KiroInvoker)
+        invoker.invoke.return_value = _make_invocation_result(
+            stdout=(
+                '{"progress":1}\n'
+                '{"tool":"read_file","args":{}}\n'
+                '{"persona":"Writer","rationale":"ok"}'
+            )
+        )
+        orch = Orchestrator(
+            invoker=invoker,
+            log_path=tmp_path / "orch.log",
+            fallback_persona="Writer",
+        )
+
+        selection = await orch.select_persona(
+            task=_make_task(), spec=_make_spec(), registry=registry
+        )
+
+        assert selection.path == "llm"
+        assert selection.persona.name == "Writer"
+        assert selection.rationale == "ok"

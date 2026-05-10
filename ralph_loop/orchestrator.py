@@ -30,13 +30,13 @@ Token usage reported by the Kiro CLI invocation is attached to the
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from ralph_loop.json_extract import extract_validating_object
 from ralph_loop.kiro import KiroInvocationTimeout, KiroInvoker
 from ralph_loop.models import (
     PersonaDescription,
@@ -163,30 +163,6 @@ def build_orchestrator_prompt(
     )
 
 
-def _extract_first_json_object(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` substring in ``text``, or ``None``.
-
-    Used as a second-chance parser when the LLM wraps its JSON response
-    in prose. Performs a simple brace-matching scan that ignores quoting
-    and escape rules — adequate for the Orchestrator use case where the
-    structured decision is flat and small.
-    """
-
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
-
 class Orchestrator:
     """LLM-backed persona selector (R4.1-R4.10).
 
@@ -310,25 +286,17 @@ class Orchestrator:
     def _parse_decision(self, raw: str) -> Optional[OrchestratorDecision]:
         """Best-effort JSON parse of the LLM response.
 
-        Tries a direct :func:`json.loads` first; if that fails, scans
-        for the first balanced ``{...}`` substring and retries. Returns
-        ``None`` when both attempts fail so the caller can take the
+        Delegates to :func:`ralph_loop.json_extract.extract_validating_object`
+        which strips markdown fences, scans every balanced ``{...}``
+        object in ``raw`` (honoring JSON string/escape state), and
+        returns the first one that validates as an
+        :class:`OrchestratorDecision`. Empty input short-circuits to
+        ``None``; when no candidate validates the caller takes the
         fallback path (R4.8).
         """
-        candidates: list[str] = []
-        if raw:
-            candidates.append(raw)
-        extracted = _extract_first_json_object(raw)
-        if extracted is not None and extracted not in candidates:
-            candidates.append(extracted)
-
-        for candidate in candidates:
-            try:
-                data = json.loads(candidate)
-                return OrchestratorDecision.model_validate(data)
-            except (json.JSONDecodeError, ValidationError):
-                continue
-        return None
+        if not raw:
+            return None
+        return extract_validating_object(raw, OrchestratorDecision)
 
     def _fallback(
         self,
