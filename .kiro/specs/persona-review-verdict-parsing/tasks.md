@@ -103,7 +103,7 @@ is required.
   - _Validates: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
   - _Exercises: Property 16, Property 17, Property 18, Property 19_
 
-- [-]* 5. Commit the fix
+- [x]* 5. Commit the fix
   - Stage only the files this bugfix touches: `ralph_loop/json_extract.py` (new), `ralph_loop/validator.py`, `ralph_loop/orchestrator.py`, `tests/test_json_extract.py` (new), `tests/test_validator.py`, `tests/test_validator_properties.py`, `tests/test_orchestrator.py`. Do not stage unrelated files.
   - Commit with a multi-line message that names the two real-world symptoms we observed: reviewer `TechCodeReviewer` on task `ch02-r01-python` burning `max_retries_per_task` on valid verdicts, and the `persona_review` check falsely marking fail when the reviewing persona wrapped JSON in a markdown fence or prepended a tool-use envelope. Reference scenarios 1.1–1.5 from design.md in the body. Do not include a `--no-verify` flag; let any configured pre-commit hooks run.
   - _Validates: none (commit only)_

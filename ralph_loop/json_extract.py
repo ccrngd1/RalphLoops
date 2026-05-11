@@ -7,6 +7,13 @@ the ``persona-review-verdict-parsing`` bugfix spec.
 
 Public surface (three functions):
 
+* :func:`strip_ansi_escapes` — removes ANSI CSI sequences
+  (``\x1b[...letter``) and two-char escapes (``\x1b=``, ``\x1bD``, etc.)
+  from ``text``. Kiro CLI embeds color/style codes in its stdout even
+  when a persona is asked to emit strict JSON (observed in real
+  TechCodeReviewer output where italics markers landed inside the
+  ``rationale`` string). Stripping them before extraction makes the
+  parser robust to terminal-targeted output.
 * :func:`strip_markdown_fences` — one-pass removal of a leading
   ``\u0060\u0060\u0060<lang>`` line and a matching trailing
   ``\u0060\u0060\u0060`` line. No-op when either fence is absent.
@@ -42,6 +49,92 @@ from typing import Iterator, Optional, TypeVar
 from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
+
+
+# Characters that terminate an ANSI CSI sequence (``\x1b[...<final>``).
+# Any byte in 0x40-0x7E can be a final byte; we accept the printable
+# range conservatively. See ECMA-48 §5.4.
+_CSI_FINAL_BYTES = frozenset(chr(c) for c in range(0x40, 0x7F))
+
+
+def strip_ansi_escapes(text: str) -> str:
+    """Remove ANSI escape sequences from ``text``.
+
+    Handles the two ESC-introducer sequence families that Kiro CLI
+    emits:
+
+    * **CSI sequences** of the form ``ESC [ <params> <final>`` where
+      ``<final>`` is a byte in the range ``0x40-0x7E`` (e.g. ``m`` for
+      SGR color/style, ``l`` / ``h`` for private modes like ``?25l``).
+    * **Two-character ESC sequences** of the form ``ESC <X>`` where
+      ``<X>`` is a printable byte outside ``[`` (e.g. ``ESC =``,
+      ``ESC D``). These are stripped as two characters.
+
+    We deliberately do NOT strip the 8-bit CSI introducer ``\\x9b``:
+    in practice Kiro CLI uses the 7-bit ``ESC[`` form, and attempting
+    to strip ``\\x9b`` can consume legitimate payload bytes when the
+    byte occurs for an unrelated reason (e.g. inside Latin-1 / mojibake
+    output). If a real 8-bit CSI stream shows up in production we
+    revisit.
+
+    Why: the reviewing persona is instructed to emit strict JSON, but
+    the Kiro CLI renders its output through a terminal-styling layer
+    that injects color/style codes **inside** the JSON's string values
+    (observed ``\\x1b[3mto\\x1b[23mdecimal_safe`` landing in a
+    ``rationale`` string). Raw control characters are not valid inside
+    JSON string literals per RFC 8259 §7, so ``json.loads`` rejects
+    them with ``Invalid control character``. Pre-stripping all ANSI
+    escapes eliminates the failure mode without changing the verdict's
+    semantic content.
+
+    O(n) in ``len(text)``; no regex; never raises.
+    """
+    if not text:
+        return text
+    # Fast path: no ESC -> nothing to strip. Avoids walking large
+    # stdouts (e.g. tool-use output) one char at a time on the happy
+    # path where the persona produced clean JSON.
+    if "\x1b" not in text:
+        return text
+
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "\x1b":
+            if i + 1 >= n:
+                # Trailing stray ESC: drop it.
+                i += 1
+                continue
+            nxt = text[i + 1]
+            if nxt == "[":
+                # CSI: ESC [ <params> <final>. Bail out if the
+                # sequence isn't terminated by a final byte within a
+                # reasonable lookahead, to avoid consuming unrelated
+                # payload. 64 bytes is far more than any real CSI
+                # sequence (longest legitimate: ~20 chars).
+                j = i + 2
+                limit = min(n, i + 64)
+                while j < limit and text[j] not in _CSI_FINAL_BYTES:
+                    j += 1
+                if j < limit:
+                    # Found a final byte, skip the whole sequence.
+                    i = j + 1
+                    continue
+                # No final byte in range: treat the ESC as literal and
+                # keep scanning. Preserves the original character to
+                # avoid corrupting payloads that happen to contain
+                # ``\\x1b`` for unrelated reasons.
+                out.append(c)
+                i += 1
+                continue
+            # Two-char ESC sequence (ESC <X>): drop both.
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def strip_markdown_fences(text: str) -> str:
@@ -91,9 +184,9 @@ def strip_markdown_fences(text: str) -> str:
 
 
 def iter_balanced_json_objects(text: str) -> Iterator[str]:
-    """Yield every top-level balanced ``{...}`` substring in ``text``.
+    """Yield every balanced ``{...}`` substring in ``text`` (nested included).
 
-    Walks ``text`` once, tracking JSON string state and escape state:
+    Walks ``text``, tracking JSON string state and escape state:
 
     * ``in_string`` toggles on an unescaped ``"``.
     * ``escape_next`` is set on ``\\`` inside a string and consumes the
@@ -101,12 +194,23 @@ def iter_balanced_json_objects(text: str) -> Iterator[str]:
     * Only unescaped, non-string ``{`` / ``}`` count as structural.
 
     When a top-level opening brace is balanced by a matching close, the
-    ``text[start : close + 1]`` slice is yielded and the outer pointer
-    advances past it. When a span is unbalanced (no matching close),
-    the outer pointer advances by one past the unmatched opening brace
-    and scanning continues; no exception is raised.
+    ``text[start : close + 1]`` slice is yielded. After yielding, the
+    scanner advances by **one character** past the opener rather than
+    past the whole span; this guarantees that nested objects are also
+    yielded, so a caller scanning for a verdict embedded inside prose
+    that happens to contain outer braces (e.g.
+    ``"{\\n{\\"verdict\\": \\"pass\\", ...}\\n}"``) still surfaces the
+    inner verdict. Callers that only care about the first VALIDATING
+    object (e.g. :func:`extract_validating_object`) short-circuit on
+    the first Pydantic success, so the extra yields are cheap.
 
-    O(n) in ``len(text)``; never raises.
+    When a span is unbalanced (no matching close), the outer pointer
+    advances by one past the unmatched opening brace and scanning
+    continues; no exception is raised.
+
+    O(n²) worst case if every character is ``{`` followed by matching
+    ``}``; O(n) on typical input where balanced spans are rare.
+    Never raises.
     """
     i = 0
     n = len(text)
@@ -145,7 +249,11 @@ def iter_balanced_json_objects(text: str) -> Iterator[str]:
 
         if balanced:
             yield text[start : j + 1]
-            i = j + 1
+            # Advance by ONE past the opener so we also visit nested
+            # opening braces. Without this, an outer balanced span
+            # (e.g. the whole of ``{ ...inner... }``) masks the inner
+            # object from the scanner and the caller never sees it.
+            i = start + 1
         else:
             # Unbalanced opening brace: advance past it and keep scanning.
             i = start + 1
@@ -166,7 +274,12 @@ def extract_validating_object(text: str, model: type[T]) -> Optional[T]:
 
     The helper never raises and is pure with respect to its arguments.
     """
-    stripped = strip_markdown_fences(text)
+    # Strip ANSI escape sequences first. Kiro CLI injects color / style
+    # codes into the reviewing persona's stdout even when the persona
+    # emits clean JSON; raw control characters inside a JSON string
+    # literal are rejected by ``json.loads`` per RFC 8259 §7.
+    stripped = strip_ansi_escapes(text)
+    stripped = strip_markdown_fences(stripped)
     for candidate in iter_balanced_json_objects(stripped):
         try:
             payload = json.loads(candidate)

@@ -530,6 +530,52 @@ async def _run_persona_review_check(
 
     duration_ms = int((time.monotonic() - start) * 1000)
     if parsed_verdict is None:
+        # --- Debug dump on parse failure ------------------------------
+        # Capture the EXACT bytes the parser saw, independent of the
+        # shared per-iteration log file (which is append-mode and
+        # commingles multiple subprocess invocations). One file per
+        # failed parse, named by task id / iteration / check name.
+        # Safe on every platform: filename components are sanitized.
+        try:
+            dump_dir = log_path.parent / "parse_failures"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            iter_hint = log_path.stem  # e.g. "iter-0001"
+            safe_task = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_" for ch in task.id
+            )
+            safe_check = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_" for ch in name
+            )
+            dump_path = (
+                dump_dir
+                / f"{iter_hint}-{safe_task}-{safe_check}-{check.persona}.txt"
+            )
+            with dump_path.open("w", encoding="utf-8") as f:
+                f.write(f"task_id: {task.id}\n")
+                f.write(f"check_name: {name}\n")
+                f.write(f"reviewing_persona: {check.persona}\n")
+                f.write(f"stdout_len: {len(invocation.stdout)}\n")
+                f.write(f"exit_code: {invocation.exit_code}\n")
+                f.write("--- STDOUT (repr) ---\n")
+                f.write(repr(invocation.stdout))
+                f.write("\n--- STDOUT (verbatim) ---\n")
+                f.write(invocation.stdout)
+                f.write("\n--- STDERR (repr) ---\n")
+                f.write(repr(invocation.stderr))
+                f.write("\n")
+            logger.warning(
+                "persona_review check %r: verdict parse failed; "
+                "wrote debug dump to %s",
+                name, dump_path,
+            )
+        except Exception:  # noqa: BLE001
+            # Debug dumping must never crash the loop.
+            logger.exception(
+                "persona_review check %r: failed to write parse-failure "
+                "debug dump",
+                name,
+            )
+
         logger.warning(
             "persona_review check %r: could not parse verdict from "
             "reviewing persona %r; marking fail",
