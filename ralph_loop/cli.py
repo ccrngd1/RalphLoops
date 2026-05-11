@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 import sys
 import time
 import uuid
@@ -57,6 +58,44 @@ from ralph_loop.tokens import TokenAccountant
 from ralph_loop.validator import Validator, ValidatorStuckError
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_commit_sha() -> str:
+    """Return the short git SHA of the ``ralph_loop`` package, or ``"unknown"``.
+
+    Best-effort: if ``git`` is not on PATH, the package isn't in a git
+    working tree, or anything else goes wrong, we return ``"unknown"``
+    rather than failing the loop. The SHA is stamped into the run log
+    so we can always answer "was the fix in effect?" from a single
+    ``grep commit_sha <run-log>``.
+    """
+    try:
+        pkg_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(pkg_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if sha:
+                # Also surface whether the working tree has uncommitted
+                # edits, since those can diverge from the recorded SHA.
+                dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(pkg_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if dirty.returncode == 0 and dirty.stdout.strip():
+                    return f"{sha}+dirty"
+                return sha
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return "unknown"
 
 
 # Exit codes used across the CLI. Grouped here so tests and operators
@@ -229,6 +268,20 @@ async def _run_loop(config: Config, project_root: Path) -> int:
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     configure_logger(log_file_path=log_dir / f"run-{run_id}.log")
+
+    commit_sha = _resolve_commit_sha()
+    # Bind the SHA into every structured log line for the remainder of
+    # this process. Lets ``grep commit_sha <run-log>`` answer "which
+    # code produced this log" without parsing stdout banners.
+    try:
+        import structlog
+        structlog.contextvars.bind_contextvars(
+            commit_sha=commit_sha, run_id=run_id,
+        )
+    except Exception:  # noqa: BLE001 - logging bind must not fail the loop
+        pass
+
+    click.echo(f"[ralph run] commit_sha={commit_sha}")
     click.echo(f"[ralph run] run_id={run_id} project_root={project_root}")
     click.echo(
         f"[ralph run] model={config.default_model_id}"

@@ -264,3 +264,52 @@ def test_ralph_init_tasks_personas_dir_override_accepted(tmp_path: Path) -> None
     # so the command exits non-zero downstream; the important signal is
     # that the R15.9 personas-missing fail-fast path did NOT fire.
     assert "Required configuration paths" not in result.output
+
+
+
+# ---------------------------------------------------------------------------
+# Commit SHA resolution (diagnostics)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveCommitSha:
+    """``_resolve_commit_sha`` stamps the run log with the current git SHA so
+    operators can tell pre-fix dumps from post-fix dumps without relying on
+    wall-clock timestamps. The helper must never raise; ``"unknown"`` is the
+    safe fallback when git isn't available or the package isn't in a git
+    working tree.
+    """
+
+    def test_returns_string(self) -> None:
+        from ralph_loop.cli import _resolve_commit_sha
+
+        sha = _resolve_commit_sha()
+        assert isinstance(sha, str)
+        assert sha
+
+    def test_is_sha_or_unknown(self) -> None:
+        """Return value should be ``unknown``, a short SHA, or ``<sha>+dirty``."""
+        from ralph_loop.cli import _resolve_commit_sha
+
+        sha = _resolve_commit_sha()
+        if sha == "unknown":
+            return
+        core = sha.removesuffix("+dirty")
+        # Short git SHA is 7+ hex chars by default; ``--short`` on modern
+        # git can return 7-10 depending on repo collisions.
+        assert 4 <= len(core) <= 40
+        assert all(c in "0123456789abcdef" for c in core)
+
+    def test_does_not_raise_when_git_missing(
+        self, monkeypatch: Any
+    ) -> None:
+        """When subprocess can't find git, the helper returns ``unknown``."""
+        import subprocess as _subproc
+
+        from ralph_loop import cli as cli_mod
+
+        def fake_run(*_args: Any, **_kwargs: Any) -> None:
+            raise FileNotFoundError("git not on PATH")
+
+        monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+        assert cli_mod._resolve_commit_sha() == "unknown"

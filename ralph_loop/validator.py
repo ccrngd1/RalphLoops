@@ -551,6 +551,18 @@ async def _run_persona_review_check(
                 / f"{iter_hint}-{safe_task}-{safe_check}-{check.persona}.txt"
             )
             with dump_path.open("w", encoding="utf-8") as f:
+                # Read the bound commit_sha from structlog context so
+                # each dump identifies the ralph_loop build that
+                # produced it. Falls back gracefully when structlog is
+                # not available or no SHA was bound.
+                commit_sha = "unknown"
+                try:
+                    import structlog
+                    ctx = structlog.contextvars.get_contextvars()
+                    commit_sha = ctx.get("commit_sha", "unknown")
+                except Exception:  # noqa: BLE001
+                    pass
+                f.write(f"commit_sha: {commit_sha}\n")
                 f.write(f"task_id: {task.id}\n")
                 f.write(f"check_name: {name}\n")
                 f.write(f"reviewing_persona: {check.persona}\n")
