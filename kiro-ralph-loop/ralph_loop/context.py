@@ -16,6 +16,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import structlog
+
 from ralph_loop.models import ContextWindow, Persona, Task, TaskSpec
 from ralph_loop.prompt_template import render_prompt
 
@@ -59,16 +61,160 @@ RESUMED_NOTICE = (
     "of the task's artifacts before proceeding.\n"
 )
 
+# Deterministic footer appended after the truncated prefix of an
+# oversized Context_File (R2.5). The template is formatted with the
+# file's original UTF-8 byte size and the configured
+# ``max_context_file_bytes`` cap so the marker is self-describing both
+# in the composed prompt and in downstream log analysis.
+TRUNCATION_MARKER_TEMPLATE = (
+    "[truncated: {original_bytes} bytes, showing first {cap} bytes]"
+)
+
 
 def _approx_tokens(text: str) -> int:
     """Estimate token count for ``text`` using a flat char ratio."""
     return len(text) // _CHARS_PER_TOKEN
 
 
+def _truncate_to_codepoint_boundary(data: bytes, cap: int) -> bytes:
+    """Return at most ``cap`` bytes of ``data`` trimmed to a whole codepoint.
+
+    UTF-8 codepoints are 1 to 4 bytes wide. A raw ``data[:cap]`` slice
+    may land in the middle of a multi-byte sequence; handing such a
+    partial codepoint to ``str.decode(..., errors="strict")`` would
+    raise. This helper rewinds the slice to the nearest complete
+    codepoint boundary so the retained prefix always decodes cleanly
+    (R2.8), while dropping at most 3 bytes so the retained length stays
+    in ``[max(0, cap - 3), cap]`` when the input exceeds the cap
+    (R2.4).
+
+    Properties (enforced by Property 21):
+
+    * ``0 <= len(retained) <= cap``.
+    * When ``len(data) > cap``: ``len(retained) >= cap - 3``.
+    * ``retained.decode("utf-8")`` succeeds under ``errors="strict"``.
+    * Idempotent: applying the function to its own output returns the
+      output unchanged.
+    """
+    # Fast path: nothing to trim when the input already fits under the
+    # cap. Returning the original ``bytes`` object keeps the
+    # idempotence predicate cheap and obvious.
+    if len(data) <= cap:
+        return data
+
+    prefix = data[:cap]
+    # UTF-8 continuation bytes match the bit pattern ``10xxxxxx`` (the
+    # top two bits are ``10``). A complete codepoint starts with a
+    # leader byte whose top two bits are one of:
+    #   0xxxxxxx  (1-byte ASCII)
+    #   110xxxxx  (start of a 2-byte sequence)
+    #   1110xxxx  (start of a 3-byte sequence)
+    #   11110xxx  (start of a 4-byte sequence)
+    # If ``prefix`` ends on a continuation byte, walk back until we
+    # reach either a leader byte or the start of the buffer. Since a
+    # codepoint is at most 4 bytes, this rewinds at most 3 bytes.
+    i = len(prefix)
+    while i > 0 and (prefix[i - 1] & 0xC0) == 0x80:
+        i -= 1
+
+    # At this point ``i == 0`` or ``prefix[i - 1]`` is a non-
+    # continuation byte. If the byte at ``i - 1`` starts a multi-byte
+    # sequence, decide whether that codepoint is complete inside
+    # ``prefix``. If incomplete (fewer continuation bytes than the
+    # leader expects), drop the partial codepoint. If complete,
+    # re-include the full codepoint so the retained prefix ends on a
+    # real codepoint boundary rather than on the leader alone.
+    if i > 0:
+        lead = prefix[i - 1]
+        if lead & 0x80:  # top bit set, so this is a multi-byte leader
+            if (lead & 0xE0) == 0xC0:
+                expected_len: Optional[int] = 2
+            elif (lead & 0xF0) == 0xE0:
+                expected_len = 3
+            elif (lead & 0xF8) == 0xF0:
+                expected_len = 4
+            else:
+                # Malformed lead (e.g. 0b11111xxx or a stray
+                # continuation-style high byte that the walk above
+                # could not consume). Drop it unconditionally so the
+                # retained prefix never contains an invalid leader.
+                expected_len = None
+            if expected_len is None:
+                i -= 1
+            else:
+                actual_len = len(prefix) - (i - 1)
+                if actual_len < expected_len:
+                    # Partial codepoint at the tail: drop the leader.
+                    i -= 1
+                else:
+                    # Complete codepoint: include every continuation
+                    # byte the leader requires. For well-formed
+                    # UTF-8 this equals ``len(prefix)``; for any
+                    # malformed tail we clamp at ``expected_len`` so
+                    # extra stray continuations are dropped.
+                    i = (i - 1) + expected_len
+
+    return prefix[:i]
+
+
+def _inline_one_context_file(
+    rel_path: str,
+    abs_path: Path,
+    *,
+    max_file_bytes: int,
+) -> str:
+    """Return the Markdown block for one Context_File, truncating if needed.
+
+    Reads ``abs_path`` as raw bytes so the byte-cap comparison matches
+    the way Kiro CLI measures its chunk limit (R2.4). Files at or under
+    the cap are returned verbatim as ``"### File: <rel_path>\\n\\n<body>"``
+    with no marker (R2.3). Files over the cap are head-truncated via
+    :func:`_truncate_to_codepoint_boundary` to keep the retained prefix
+    well-formed UTF-8 (R2.8), and a deterministic Truncation_Marker is
+    appended on its own line so it is visibly distinct in the composed
+    prompt (R2.5, R2.7). Each truncation emits a WARNING-level
+    structured log record (Truncation_Event, R2.6) carrying the path,
+    the original byte size, the retained byte size, and the configured
+    cap so operators can correlate large-file truncations with
+    downstream iteration outcomes.
+
+    Decoding uses ``errors="replace"`` to match the behaviour of the
+    existing :func:`inline_context_files` callers: a file that already
+    contains malformed UTF-8 still renders (with replacement
+    characters) rather than raising.
+    """
+    data = abs_path.read_bytes()
+    original = len(data)
+    if original <= max_file_bytes:
+        body = data.decode("utf-8", errors="replace")
+        return f"### File: {rel_path}\n\n{body}"
+
+    trimmed = _truncate_to_codepoint_boundary(data, max_file_bytes)
+    retained = len(trimmed)
+    body = trimmed.decode("utf-8", errors="replace")
+    marker = TRUNCATION_MARKER_TEMPLATE.format(
+        original_bytes=original, cap=max_file_bytes
+    )
+    # Emit the Truncation_Event so operators can correlate large-file
+    # truncations with subsequent validation/invocation outcomes
+    # (R2.6, R2.9).
+    structlog.get_logger().warning(
+        "context_file_truncated",
+        path=rel_path,
+        original_bytes=original,
+        retained_bytes=retained,
+        cap_bytes=max_file_bytes,
+    )
+    # Marker sits on its own line after the body so it is visibly
+    # distinct in the composed prompt (R2.7).
+    return f"### File: {rel_path}\n\n{body}\n{marker}"
+
+
 def inline_context_files(
     paths: list[str],
     *,
     base_dir: Optional[Path] = None,
+    max_file_bytes: int = 65536,
 ) -> tuple[str, list[str]]:
     """Inline the contents of every path in ``paths`` (R18.5, R18.6).
 
@@ -82,6 +228,14 @@ def inline_context_files(
     ``base_dir`` scopes relative paths to the project root when the
     caller has one. When ``None``, paths resolve against the process
     working directory.
+
+    ``max_file_bytes`` bounds the UTF-8 byte size of any single inlined
+    file (R2.3, R2.4). Files at or under the cap are emitted verbatim;
+    files over the cap are head-truncated on a UTF-8 codepoint boundary
+    with a deterministic Truncation_Marker appended (R2.5, R2.7) and a
+    WARNING-level Truncation_Event logged (R2.6). The default of
+    65536 bytes matches :attr:`Config.max_context_file_bytes` so callers
+    that do not pass a cap get the same behaviour as the loop.
     """
     parts: list[str] = []
     missing: list[str] = []
@@ -89,8 +243,11 @@ def inline_context_files(
         candidate = Path(p) if base_dir is None else base_dir / p
         try:
             if candidate.is_file():
-                contents = candidate.read_text(encoding="utf-8")
-                parts.append(f"### File: {p}\n\n{contents}")
+                parts.append(
+                    _inline_one_context_file(
+                        p, candidate, max_file_bytes=max_file_bytes
+                    )
+                )
             else:
                 logger.warning("Context file not found: %s", p)
                 missing.append(p)
@@ -131,6 +288,7 @@ def compose_context(
     escalation_context: Optional[str] = None,
     resumed_notice: bool = False,
     max_tokens: int = 32_000,
+    max_file_bytes: int = 65536,
     base_dir: Optional[Path] = None,
 ) -> ContextWindow:
     """Assemble the Context Window for a single iteration.
@@ -145,6 +303,16 @@ def compose_context(
     6. Persona instructions (R6.5), when present.
     7. Escalation context (R5.3), when present.
 
+    ``max_file_bytes`` bounds the UTF-8 byte size of any single inlined
+    Context_File (R2.3, R2.4). The cap is forwarded to
+    :func:`inline_context_files`, which head-truncates over-cap files on
+    a codepoint boundary and appends a deterministic Truncation_Marker
+    (R2.5, R2.7). Per-file truncation runs before assembly and is
+    independent of the whole-window token-budget fallback below
+    (R2.10); the default of 65536 bytes matches
+    :attr:`Config.max_context_file_bytes` so callers that omit the cap
+    get the same behaviour as the loop.
+
     Token overflow (R6.7): when the composed text's approximate token
     count exceeds ``max_tokens``, the project brief is truncated to its
     first ``_BRIEF_SUMMARY_CHARS`` characters plus an explicit
@@ -152,7 +320,11 @@ def compose_context(
     instructions, and escalation context are preserved untouched.
     """
     context_files = spec.context_files or []
-    inlined, _missing = inline_context_files(context_files, base_dir=base_dir)
+    inlined, _missing = inline_context_files(
+        context_files,
+        base_dir=base_dir,
+        max_file_bytes=max_file_bytes,
+    )
     task_spec_text = _render_task_spec_section(spec, inlined)
 
     rendered_prompt = render_prompt(

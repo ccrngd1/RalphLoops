@@ -246,8 +246,9 @@ class Config(BaseModel):
     per_run_task_creation_budget: int = Field(default=100, ge=0)
     max_creation_chain_depth: int = Field(default=5, ge=0)
 
-    # Context (R6.7)
+    # Context (R6.7, R2.1-R2.2)
     max_context_tokens: int = Field(default=32_000, ge=1)
+    max_context_file_bytes: int = Field(default=65536, gt=0)
 
     # Git (R15.3, R15.6)
     git_integration_enabled: bool = True

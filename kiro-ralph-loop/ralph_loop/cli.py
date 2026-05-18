@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import click
+import structlog
 
 from ralph_loop.atomic_io import atomic_write_bytes
 from ralph_loop.budget import BudgetTracker
@@ -29,9 +30,10 @@ from ralph_loop.config import ConfigLoadError, load_config
 from ralph_loop.context import compose_context
 from ralph_loop.escalation import EscalationHandler
 from ralph_loop.git_manager import GitManager
-from ralph_loop.kiro import KiroInvoker
+from ralph_loop.kiro import KiroInvocationTimeout, KiroInvoker
 from ralph_loop.logger import configure_logger, write_run_summary
 from ralph_loop.models import (
+    CheckResult,
     Config,
     IterationOutcome,
     LlmCallRecord,
@@ -481,6 +483,7 @@ async def _run_loop(config: Config, project_root: Path) -> int:
             brief=brief,
             resumed_notice=bool(task.resumed_from_interruption),
             max_tokens=config.max_context_tokens,
+            max_file_bytes=config.max_context_file_bytes,
             base_dir=project_root,
         )
 
@@ -504,13 +507,22 @@ async def _run_loop(config: Config, project_root: Path) -> int:
                 cwd=project_root,
                 model_id=config.default_model_id,
             )
+        except (KeyboardInterrupt, SystemExit):
+            # Operator- and platform-initiated shutdowns must never be
+            # swallowed by the graceful-continue handler below (R1.3).
+            raise
         except Exception as exc:  # noqa: BLE001 - subprocess errors
-            click.echo(
-                f"Kiro CLI invocation failed for task {task.id}: {exc}",
-                err=True,
+            _handle_invocation_error(
+                exc=exc,
+                task=task,
+                persona_name=selection.persona.name,
+                tasks=tasks,
+                tasks_path=tasks_path,
             )
-            exit_code = EXIT_INVOCATION_ERROR
-            break
+            # Pick up the persisted status/retry update so the next
+            # iteration starts from a consistent tasks list (R1.4, R1.9).
+            tasks = _load_tasks(tasks_path)
+            continue
 
         # Read the post-iteration snapshot of tasks.json as raw dicts
         # so unauthorized edits can be reverted (R8.8).
@@ -706,6 +718,94 @@ def _update_task(
             updated.append(t)
     atomic_write_bytes(tasks_path, TASK_LIST_ADAPTER.dump_json(updated))
     return updated
+
+
+# Substring (matched case-insensitively) used to classify a Kiro CLI
+# invocation failure as a chunk-limit failure (R1.7). Kept as a
+# module-level constant so it is easy to grep for and to keep the
+# handler pure w.r.t. string literals.
+CHUNK_LIMIT_SUBSTRING = "chunk exceed the limit"
+
+
+def _excerpt(s: str, limit: int = 2000) -> str:
+    """Trim free-form captured output to a bounded excerpt for log records.
+
+    Returns ``s`` unchanged when it is already at or below ``limit``
+    characters; otherwise returns the first ``limit`` characters
+    followed by a ``"...[truncated N chars]"`` suffix so downstream
+    consumers know the value was clipped. Non-string inputs are coerced
+    via :func:`str` so callers can pass ``getattr`` results without
+    first type-checking them.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"...[truncated {len(s) - limit} chars]"
+
+
+def _handle_invocation_error(
+    *,
+    exc: Exception,
+    task: Task,
+    persona_name: str,
+    tasks: list[Task],
+    tasks_path: Path,
+) -> None:
+    """Record an Invocation_Error as a synthetic Iteration_Failure (R1.1-R1.9).
+
+    Reuses :func:`status_after_validation` by feeding it a synthetic
+    failing ``CheckResult`` so the retry-count and status-transition
+    rules stay identical to a failed ``persona_review`` (R1.1, R3.2).
+    Persists the updated task list atomically via :func:`_update_task`
+    **before** emitting the structured log record so a crash in the
+    logger path cannot lose the status update (R1.4).
+    """
+    stdout_raw = getattr(exc, "stdout", "") or ""
+    stderr_raw = getattr(exc, "stderr", "") or ""
+    stdout_excerpt = _excerpt(stdout_raw)
+    stderr_excerpt = _excerpt(stderr_raw)
+
+    combined = (str(exc) + str(stderr_raw) + str(stdout_raw)).lower()
+    chunk_limit_detected = CHUNK_LIMIT_SUBSTRING in combined
+
+    # Build a synthetic failing CheckResult. The Validator never ran,
+    # so we mark the synthetic check with ``type="shell"`` plus a
+    # stable sentinel name so the log row is recognisable. We do NOT
+    # invent a new check type so R3.1 ("no new call_kind values, no
+    # new Task status values, no new terminal states") holds.
+    synthetic = CheckResult(
+        type="shell",
+        name="kiro_invocation",
+        verdict="fail",
+        output=f"invocation_error: {type(exc).__name__}: {exc}",
+        duration_ms=0,
+        timed_out=isinstance(exc, KiroInvocationTimeout),
+    )
+    new_status, new_retry = status_after_validation(task, [synthetic])
+
+    # Persist atomically BEFORE structured logging so a crash in the
+    # logger path cannot lose the status update (R1.4).
+    _update_task(
+        tasks,
+        task.id,
+        {"status": new_status, "retry_count": new_retry},
+        tasks_path,
+    )
+
+    structlog.get_logger().error(
+        "iteration_invocation_error",
+        task_id=task.id,
+        persona_name=persona_name,
+        exception_type=type(exc).__name__,
+        exception_message=str(exc),
+        stdout_excerpt=stdout_excerpt,
+        stderr_excerpt=stderr_excerpt,
+        chunk_limit_detected=chunk_limit_detected,
+        failure_mode="chunk_limit" if chunk_limit_detected else "generic",
+        new_status=new_status,
+        new_retry_count=new_retry,
+    )
 
 
 # ============================================================================

@@ -29,8 +29,10 @@ from typing import Any
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from pydantic import ValidationError
 
 from ralph_loop.config import ConfigLoadError, load_config
+from ralph_loop.models import Config
 
 
 # ---------------------------------------------------------------------------
@@ -245,3 +247,133 @@ def test_missing_required_path_raises(missing: str) -> None:
                 project_root=project_root,
                 cli_overrides={"fallback_persona": "Writer"},
             )
+
+
+# ---------------------------------------------------------------------------
+# Property 23: ``max_context_file_bytes`` is additive with default 65536
+# (R2.1, R2.2, R3.4)
+# ---------------------------------------------------------------------------
+
+
+# Feature: resilient-invocation-and-context-truncation, Property 23:
+# Config field is additive with default 65536.
+#
+# For any valid existing ``ralph.config.json`` (any combination of
+# currently-defined fields, omitting ``max_context_file_bytes``),
+# ``Config.model_validate(dict)`` succeeds and the resulting ``Config``
+# has ``max_context_file_bytes == 65536``. When the dict provides the
+# field as a positive int ``v``, the resulting ``Config`` carries that
+# value unchanged. When the dict provides a non-positive int or a
+# non-int, ``Config.model_validate`` raises ``ValidationError``.
+
+
+# Strategy over valid existing configs without the new field. Every
+# entry lines up with a field defined on the current ``Config`` model
+# and stays inside that field's documented constraint (see
+# ``ralph_loop/models.py::Config``). ``fallback_persona`` is required;
+# every other field is covered by ``fixed_dictionaries(..., optional=...)``
+# so the absent-field branch is exercised too.
+_existing_config_strategy = st.fixed_dictionaries(
+    {
+        "fallback_persona": st.sampled_from(["Writer", "Editor", "Reviewer"]),
+    },
+    optional={
+        "max_iterations": st.integers(min_value=1, max_value=1000),
+        "max_retries_per_task": st.integers(min_value=1, max_value=20),
+        "escalation_threshold": st.integers(min_value=0, max_value=10),
+        "automatic_planner": st.booleans(),
+        "git_integration_enabled": st.booleans(),
+        "max_context_tokens": st.integers(min_value=1, max_value=128_000),
+        "pending_tasks_path": st.sampled_from(
+            ["pending_tasks.json", "queue.json", "state/pending.json"]
+        ),
+    },
+)
+
+
+# Strategy for values that are NOT positive ints and must therefore
+# trigger a ``ValidationError``. Pydantic v2 in its default lax mode
+# coerces bool to int (``True`` -> ``1``) and numeric strings like
+# ``"123"`` to ``int`` (which then pass ``gt=0``), so we deliberately
+# draw shapes Pydantic never coerces to a positive int:
+#
+# - integers with ``max_value=0`` cover ``0`` and all negative values
+#   (``gt=0`` rejects them),
+# - floats with a non-zero fractional part cannot lossless-coerce,
+# - non-numeric strings, lists, dicts, and ``None`` also cannot coerce.
+_invalid_bytes_value_strategy = st.one_of(
+    st.integers(max_value=0),
+    st.floats(
+        min_value=-1000.0,
+        max_value=1000.0,
+        allow_nan=False,
+        allow_infinity=False,
+    ).filter(lambda f: not float(f).is_integer()),
+    st.text(alphabet="abcdef ", min_size=1, max_size=8),
+    st.lists(st.integers(), min_size=0, max_size=3),
+    st.dictionaries(st.text(max_size=4), st.integers(), max_size=3),
+    st.none(),
+)
+
+
+@given(existing=_existing_config_strategy)
+def test_property_23_field_absent_uses_default(existing: dict[str, Any]) -> None:
+    """Validates Requirements 2.1, 2.2, 3.4.
+
+    For any valid existing config dict that omits
+    ``max_context_file_bytes``, ``Config.model_validate`` must succeed
+    and the resulting ``Config`` must carry the documented default of
+    65536 bytes (R2.1, R2.2). This also covers R3.4 -- existing
+    ``ralph.config.json`` files parse unchanged without the new field.
+    """
+    assert "max_context_file_bytes" not in existing
+
+    cfg = Config.model_validate(existing)
+
+    assert cfg.max_context_file_bytes == 65536
+
+
+@given(
+    existing=_existing_config_strategy,
+    v=st.integers(min_value=1, max_value=10 * 1024 * 1024),
+)
+def test_property_23_field_present_roundtrips(
+    existing: dict[str, Any], v: int
+) -> None:
+    """Validates Requirements 2.1, 3.4.
+
+    For any existing valid config dict and any positive int ``v`` in the
+    1-byte to 10 MiB range, merging ``{"max_context_file_bytes": v}``
+    into the dict yields a ``Config`` whose ``max_context_file_bytes``
+    equals ``v``. The upper bound on ``v`` is a practical range for a
+    byte cap and is not a constraint imposed by the ``Config`` model.
+    """
+    merged = {**existing, "max_context_file_bytes": v}
+
+    cfg = Config.model_validate(merged)
+
+    assert cfg.max_context_file_bytes == v
+
+
+@given(
+    existing=_existing_config_strategy,
+    invalid=_invalid_bytes_value_strategy,
+)
+def test_property_23_rejects_non_positive_or_non_int(
+    existing: dict[str, Any], invalid: Any
+) -> None:
+    """Validates Requirements 2.1.
+
+    For any existing valid config dict, injecting
+    ``max_context_file_bytes`` with either a non-positive int or a
+    shape Pydantic cannot coerce to a positive int must raise
+    ``ValidationError``. ``bool`` is not sampled here because Python's
+    ``True``/``False`` inherit from ``int`` and Pydantic coerces them
+    to ``1`` / ``0`` respectively; ``0`` is still rejected via
+    ``gt=0``, which is covered by the ``integers(max_value=0)`` branch
+    above.
+    """
+    merged = {**existing, "max_context_file_bytes": invalid}
+
+    with pytest.raises(ValidationError):
+        Config.model_validate(merged)

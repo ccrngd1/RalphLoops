@@ -1,5 +1,5 @@
 """Property-based tests for ``ralph_loop.context`` (design Properties 9,
-10, 12).
+10, 12, 21).
 
 - Property 9 (Context window content inclusion): for any task / spec /
   persona / brief, the composed text includes the loop framing, the
@@ -25,13 +25,37 @@
   context file is missing.
 
   Validates: Requirements 18.5, 18.6.
+
+- Property 21 (Truncation is idempotent and byte-bounded): for any
+  ``bytes`` payload and any positive ``cap``,
+  ``_truncate_to_codepoint_boundary`` produces a prefix whose length
+  is bounded by ``[max(0, cap - 3), cap]`` when the input exceeds the
+  cap, is unchanged on a second application, and — when the input is
+  itself well-formed UTF-8 — decodes cleanly under strict UTF-8. R2.8
+  constrains only the cut point at the tail, so malformed interior
+  bytes in the input pass through unchanged (real callers decode with
+  ``errors="replace"``).
+
+  Validates: Requirements 2.4, 2.8.
+
+- Property 22 (Truncation marker invariant): for any ``bytes`` payload
+  ``data`` of size ``N`` written to a tempfile and any positive
+  ``cap``, the Markdown block returned by ``_inline_one_context_file``
+  ends with the Truncation_Marker when ``N > cap`` and contains no
+  ``"[truncated:"`` substring when ``N <= cap``. The marker's captured
+  groups are ``(str(N), str(cap))``.
+
+  Validates: Requirements 2.4, 2.5, 2.7.
 """
 
+# Feature: resilient-invocation-and-context-truncation, Property 21: Truncation is idempotent and byte-bounded
+# Feature: resilient-invocation-and-context-truncation, Property 22: Truncation marker invariant
 # Feature: ralph-loop, Property 9 & 10 & 12: Context window content inclusion, truncation, and missing-reference warnings
 
 from __future__ import annotations
 
 import logging
+import re
 import string
 from pathlib import Path
 
@@ -42,6 +66,9 @@ from hypothesis import strategies as st
 from ralph_loop.context import (
     LOOP_FRAMING,
     RESUMED_NOTICE,
+    TRUNCATION_MARKER_TEMPLATE,
+    _inline_one_context_file,
+    _truncate_to_codepoint_boundary,
     compose_context,
     inline_context_files,
 )
@@ -457,3 +484,143 @@ def test_compose_context_does_not_abort_on_missing_context_files(
     # Present files were inlined; missing ones silently omitted.
     for name in set(paths) & present:
         assert contents[name] in window.text
+
+
+# ---------------------------------------------------------------------------
+# Property 21: Truncation is idempotent and byte-bounded
+# ---------------------------------------------------------------------------
+
+
+@settings(max_examples=200)
+@given(
+    data=st.binary(max_size=2048),
+    cap=st.integers(min_value=1, max_value=1024),
+)
+def test_truncate_to_codepoint_boundary_byte_bounded_and_idempotent(
+    data: bytes, cap: int
+) -> None:
+    """Validates: Requirements 2.4, 2.8.
+
+    For any ``bytes`` payload ``data`` and any positive ``cap``, the
+    retained prefix produced by
+    :func:`_truncate_to_codepoint_boundary` must satisfy three
+    predicates jointly:
+
+    1. **Byte bounds (R2.4).** ``0 <= len(retained) <= cap``, and when
+       ``len(data) > cap`` the retained length is at least
+       ``cap - 3`` because a UTF-8 codepoint is at most 4 bytes wide
+       so the boundary rewind drops at most 3 bytes. When the input
+       already fits under the cap, the function returns it unchanged.
+    2. **Strict UTF-8 decode at the cut point (R2.8).** R2.8
+       constrains only the *cut point* at the tail: when truncation
+       cuts inside a multi-byte code point, the helper rewinds to the
+       nearest complete code point boundary so the tail is not a
+       partial code point. It does **not** promise to sanitize
+       malformed byte sequences that live in the *interior* of the
+       input — real callers decode the retained prefix with
+       ``errors="replace"`` and a standalone continuation byte in the
+       middle of the input is simply passed through. The property
+       therefore enforces strict-UTF-8 decodability of ``retained``
+       only when the input was well-formed UTF-8 to begin with and
+       truncation actually occurred; when the input already contains
+       malformed interior bytes, those bytes survive in ``retained``
+       unchanged and strict decoding is not required.
+    3. **Idempotence.** Applying the function to its own output
+       returns the output unchanged, so repeated truncation of an
+       already-truncated prefix is a no-op.
+    """
+    retained = _truncate_to_codepoint_boundary(data, cap)
+
+    # 1. Byte bounds.
+    assert 0 <= len(retained) <= cap
+    if len(data) > cap:
+        assert len(retained) >= cap - 3
+    else:
+        assert retained == data
+
+    # 2. Strict UTF-8 decode at the tail: when truncation occurred AND
+    # the original input was well-formed UTF-8, the retained prefix
+    # must also be well-formed. R2.8 only constrains the cut-point's
+    # well-formedness, so malformed interior bytes in the input are
+    # preserved as-is (real callers decode with ``errors="replace"``).
+    if len(data) > cap:
+        try:
+            data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            pass  # input already malformed; R2.8 does not constrain output
+        else:
+            retained.decode("utf-8", errors="strict")
+
+    # 3. Idempotence.
+    assert _truncate_to_codepoint_boundary(retained, cap) == retained
+
+
+# ---------------------------------------------------------------------------
+# Property 22: Truncation marker invariant
+# ---------------------------------------------------------------------------
+
+
+# Regex for the Truncation_Marker as it appears at the end of a Markdown
+# block emitted by ``_inline_one_context_file``. The marker sits on its
+# own line after the body (R2.7), so the pattern anchors on a leading
+# newline and on end-of-string (``\Z``). The two captured groups are the
+# original byte size and the configured cap, both rendered as decimal
+# integers by ``str.format``.
+TRUNCATION_MARKER_REGEX = (
+    r"\n\[truncated: (\d+) bytes, showing first (\d+) bytes\]\Z"
+)
+
+
+@settings(
+    max_examples=200,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    data=st.binary(max_size=4096),
+    cap=st.integers(min_value=1, max_value=512),
+)
+def test_inline_one_context_file_marker_invariant(
+    tmp_path: Path,
+    data: bytes,
+    cap: int,
+) -> None:
+    """Validates: Requirements 2.4, 2.5, 2.7.
+
+    For any ``bytes`` payload ``data`` of size ``N`` written to a
+    tempfile and any positive ``cap``, the Markdown block returned by
+    :func:`_inline_one_context_file` satisfies the Truncation_Marker
+    invariant in both directions:
+
+    * **Over-cap branch (R2.4, R2.5, R2.7).** When ``N > cap``, the
+      block ends with the Truncation_Marker on its own line,
+      ``TRUNCATION_MARKER_REGEX`` matches at the tail, and the two
+      captured groups equal ``(str(N), str(cap))`` — i.e. the marker
+      faithfully records the original byte size and the configured
+      cap.
+    * **Under-or-at-cap branch (R2.3).** When ``N <= cap``, the block
+      contains no ``"[truncated:"`` substring at all, so the marker
+      cannot leak into files that were included verbatim.
+
+    A fresh per-example subdirectory keeps the counter-example
+    reproducible when Hypothesis reuses ``tmp_path`` across examples
+    in the same pytest invocation.
+    """
+    base_dir = _fresh_subdir(tmp_path)
+    path = base_dir / "ctx.md"
+    path.write_bytes(data)
+    n = len(data)
+
+    block = _inline_one_context_file(
+        "ctx.md", path, max_file_bytes=cap
+    )
+
+    if n > cap:
+        match = re.search(TRUNCATION_MARKER_REGEX, block)
+        assert match is not None, (
+            f"marker missing from over-cap block (N={n}, cap={cap}): "
+            f"{block!r}"
+        )
+        assert match.group(1) == str(n)
+        assert match.group(2) == str(cap)
+    else:
+        assert "[truncated:" not in block
