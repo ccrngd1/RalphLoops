@@ -1,0 +1,191 @@
+{
+  "$defs": {
+    "ModelPrice": {
+      "description": "Per-token pricing for a single model id (R12.3, R12.4).",
+      "properties": {
+        "input_price_per_token": {
+          "minimum": 0,
+          "title": "Input Price Per Token",
+          "type": "number"
+        },
+        "output_price_per_token": {
+          "minimum": 0,
+          "title": "Output Price Per Token",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input_price_per_token",
+        "output_price_per_token"
+      ],
+      "title": "ModelPrice",
+      "type": "object"
+    }
+  },
+  "description": "Runtime configuration for a Ralph Loop run (R15.3).\n\n``fallback_persona`` is the only required field; every other knob has a\ndocumented default drawn from R10.x, R5.5, R6.7, R7.13, R15.5-R15.7.",
+  "properties": {
+    "automatic_planner": {
+      "default": false,
+      "title": "Automatic Planner",
+      "type": "boolean"
+    },
+    "escalation_persona": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Escalation Persona"
+    },
+    "escalation_threshold": {
+      "default": 3,
+      "minimum": 0,
+      "title": "Escalation Threshold",
+      "type": "integer"
+    },
+    "fallback_persona": {
+      "title": "Fallback Persona",
+      "type": "string"
+    },
+    "git_integration_enabled": {
+      "default": true,
+      "title": "Git Integration Enabled",
+      "type": "boolean"
+    },
+    "kiro_cli_command": {
+      "default": "kiro-cli",
+      "title": "Kiro Cli Command",
+      "type": "string"
+    },
+    "log_dir": {
+      "default": "logs/",
+      "title": "Log Dir",
+      "type": "string"
+    },
+    "max_context_tokens": {
+      "default": 32000,
+      "minimum": 1,
+      "title": "Max Context Tokens",
+      "type": "integer"
+    },
+    "max_creation_chain_depth": {
+      "default": 5,
+      "minimum": 0,
+      "title": "Max Creation Chain Depth",
+      "type": "integer"
+    },
+    "max_iterations": {
+      "default": 50,
+      "minimum": 1,
+      "title": "Max Iterations",
+      "type": "integer"
+    },
+    "max_retries_per_task": {
+      "default": 5,
+      "minimum": 1,
+      "title": "Max Retries Per Task",
+      "type": "integer"
+    },
+    "model_pricing": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelPrice"
+      },
+      "title": "Model Pricing",
+      "type": "object"
+    },
+    "orchestrator_llm_command": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Orchestrator Llm Command"
+    },
+    "orchestrator_model_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Orchestrator Model Id"
+    },
+    "pending_tasks_path": {
+      "default": "pending_tasks.json",
+      "title": "Pending Tasks Path",
+      "type": "string"
+    },
+    "per_iteration_task_creation_budget": {
+      "default": 10,
+      "minimum": 0,
+      "title": "Per Iteration Task Creation Budget",
+      "type": "integer"
+    },
+    "per_run_task_creation_budget": {
+      "default": 100,
+      "minimum": 0,
+      "title": "Per Run Task Creation Budget",
+      "type": "integer"
+    },
+    "personas_dir": {
+      "default": "personas/",
+      "title": "Personas Dir",
+      "type": "string"
+    },
+    "planner_persona": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Planner Persona"
+    },
+    "specs_dir": {
+      "default": "specs/",
+      "title": "Specs Dir",
+      "type": "string"
+    },
+    "summary_path": {
+      "default": "SUMMARY.md",
+      "title": "Summary Path",
+      "type": "string"
+    },
+    "tasks_path": {
+      "default": "tasks.json",
+      "title": "Tasks Path",
+      "type": "string"
+    },
+    "validation_timeout_ms": {
+      "default": 300000,
+      "minimum": 0,
+      "title": "Validation Timeout Ms",
+      "type": "integer"
+    },
+    "wall_clock_timeout_ms": {
+      "default": 3600000,
+      "minimum": 0,
+      "title": "Wall Clock Timeout Ms",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "fallback_persona"
+  ],
+  "title": "Config",
+  "type": "object"
+}

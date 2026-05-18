@@ -1,0 +1,168 @@
+{
+  "description": "A single entry in ``tasks.json`` (R2.1, R2.2).\n\nThe model captures the required fields (id, title, priority, status,\nspec_path, retry_count) plus optional routing, dependency, and\nprovenance metadata used by the task creation and pending-queue\nsubsystems (R8.5, R8.12, R8.13, R9.7, R14.5).",
+  "properties": {
+    "admitted_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Admitted Run Id"
+    },
+    "created_at_iteration": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created At Iteration"
+    },
+    "created_by_persona": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Created By Persona"
+    },
+    "creation_chain": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Creation Chain"
+    },
+    "depends_on": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Depends On"
+    },
+    "id": {
+      "minLength": 1,
+      "title": "Id",
+      "type": "string"
+    },
+    "priority": {
+      "title": "Priority",
+      "type": "integer"
+    },
+    "resumed_from_interruption": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Resumed From Interruption"
+    },
+    "retry_count": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Retry Count",
+      "type": "integer"
+    },
+    "spec_path": {
+      "minLength": 1,
+      "title": "Spec Path",
+      "type": "string"
+    },
+    "spilled_run_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Spilled Run Id"
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "passing",
+        "failing",
+        "stuck"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "tags": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tags"
+    },
+    "target_persona": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Target Persona"
+    },
+    "title": {
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "priority",
+    "status",
+    "spec_path"
+  ],
+  "title": "Task",
+  "type": "object"
+}

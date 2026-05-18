@@ -1,0 +1,300 @@
+{
+  "$defs": {
+    "FileExistsCheckConfig": {
+      "description": "Validation check that asserts every path exists (R7.4, R7.11).",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        },
+        "type": {
+          "const": "file_exists",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "paths"
+      ],
+      "title": "FileExistsCheckConfig",
+      "type": "object"
+    },
+    "PersonaReviewCheckConfig": {
+      "description": "Validation check that invokes a reviewing persona (R7.3, R7.6, R7.7).\n\n``persona`` names the reviewing persona. ``pass_condition`` is the\noptional spec-level override; when absent, the reviewing persona's\ndefault pass condition is used (R7.7). If neither is present, the\nexecuting task is marked stuck (R7.8).",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "pass_condition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pass Condition"
+        },
+        "persona": {
+          "title": "Persona",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout Ms"
+        },
+        "type": {
+          "const": "persona_review",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "persona"
+      ],
+      "title": "PersonaReviewCheckConfig",
+      "type": "object"
+    },
+    "ShellCheckConfig": {
+      "description": "Validation check that runs one or more shell commands (R7.2, R7.5).",
+      "properties": {
+        "commands": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Commands",
+          "type": "array"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "timeout_ms": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timeout Ms"
+        },
+        "type": {
+          "const": "shell",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "commands"
+      ],
+      "title": "ShellCheckConfig",
+      "type": "object"
+    },
+    "TaskSpecBody": {
+      "description": "The prose body of a Task_Spec (R18.3).\n\nThis is the structured representation of the sections that follow the\nYAML frontmatter: ``objective``, ``context_references``, ``instructions``,\nand the optional ``notes`` section.",
+      "properties": {
+        "context_references": {
+          "title": "Context References",
+          "type": "string"
+        },
+        "instructions": {
+          "title": "Instructions",
+          "type": "string"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Notes"
+        },
+        "objective": {
+          "title": "Objective",
+          "type": "string"
+        }
+      },
+      "required": [
+        "objective",
+        "context_references",
+        "instructions"
+      ],
+      "title": "TaskSpecBody",
+      "type": "object"
+    }
+  },
+  "description": "A parsed Task_Spec file (R18.1-R18.4, R7.1).\n\nRequired fields: ``id``, ``title``, and at least one ``validation`` entry\n(R18.1). Optional routing and configuration fields follow R18.2:\n``target_persona`` (explicit routing override), ``tags`` (input to the\nOrchestrator's LLM persona selection), ``depends_on`` (mirrors the same\nfield on the Task entry in tasks.json), ``persona_fields`` (persona-\nspecific configuration passed to the selected persona's prompt template),\nand ``context_files`` (relative paths inlined into the Context_Window\nper R18.5).\n\nThe ``body`` field holds the structured prose sections (R18.3).",
+  "properties": {
+    "body": {
+      "$ref": "#/$defs/TaskSpecBody"
+    },
+    "context_files": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Context Files"
+    },
+    "depends_on": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Depends On"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "persona_fields": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Persona Fields"
+    },
+    "tags": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tags"
+    },
+    "target_persona": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Target Persona"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "validation": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "file_exists": "#/$defs/FileExistsCheckConfig",
+            "persona_review": "#/$defs/PersonaReviewCheckConfig",
+            "shell": "#/$defs/ShellCheckConfig"
+          },
+          "propertyName": "type"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/ShellCheckConfig"
+          },
+          {
+            "$ref": "#/$defs/PersonaReviewCheckConfig"
+          },
+          {
+            "$ref": "#/$defs/FileExistsCheckConfig"
+          }
+        ]
+      },
+      "minItems": 1,
+      "title": "Validation",
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "validation",
+    "body"
+  ],
+  "title": "TaskSpec",
+  "type": "object"
+}

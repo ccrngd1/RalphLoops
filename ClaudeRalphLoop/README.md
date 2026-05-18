@@ -1,8 +1,8 @@
-# Ralph Loop
+# Ralph Loop (Claude Code Edition)
 
-Ralph Loop is a domain-agnostic automated iteration wrapper for Kiro CLI. It drives an agent through a persistent loop until explicit completion criteria are met, rather than relying on a single long-running session that drifts as context accumulates.
+Ralph Loop is a domain-agnostic automated iteration wrapper for Claude Code CLI. It drives an agent through a persistent loop until explicit completion criteria are met, rather than relying on a single long-running session that drifts as context accumulates.
 
-Each iteration is a fresh, short-lived Kiro CLI session that works on exactly one task under exactly one persona. The filesystem (`tasks.json`, `specs/`, `personas/`, `SUMMARY.md`, `pending_tasks.json`, logs under `logs/`) is the durable state between iterations; in-memory agent context is discarded. Git acts as an append-only audit trail of working-tree changes. The loop keeps going until every task passes validation, a budget cap is hit, or the run is blocked on unresolved dependencies.
+Each iteration is a fresh, short-lived Claude Code CLI session that works on exactly one task under exactly one persona. The filesystem (`tasks.json`, `specs/`, `personas/`, `SUMMARY.md`, `pending_tasks.json`, logs under `logs/`) is the durable state between iterations; in-memory agent context is discarded. Git acts as an append-only audit trail of working-tree changes. The loop keeps going until every task passes validation, a budget cap is hit, or the run is blocked on unresolved dependencies.
 
 ## Quickstart
 
@@ -70,13 +70,13 @@ ralph rollback 7
 | `escalation_threshold` | `3` | 5.5 |
 | `planner_persona` | `null` | 17.1, 15.3 |
 | `automatic_planner` | `false` | 15.7, 17.3 |
-| `orchestrator_llm_command` | `null` (falls back to `kiro_cli_command`) | 15.3, 15.4 |
+| `orchestrator_llm_command` | `null` (falls back to `claude_cli_command`) | 15.3, 15.4 |
 | `orchestrator_model_id` | `null` | 15.3 |
 | `max_iterations` | `50` | 10.1 |
 | `max_retries_per_task` | `5` | 10.2 |
 | `wall_clock_timeout_ms` | `3_600_000` (1 hour) | 10.4 |
 | `validation_timeout_ms` | `300_000` (5 minutes) | 7.13 |
-| `kiro_cli_command` | `"kiro-cli"` | 15.3 |
+| `claude_cli_command` | `"claude"` | 15.3 |
 | `per_iteration_task_creation_budget` | `10` | 10.6 |
 | `per_run_task_creation_budget` | `100` | 10.7 |
 | `max_creation_chain_depth` | `5` | 10.8 |
@@ -160,7 +160,7 @@ A check that runs longer than `validation_timeout_ms` is terminated and reported
 
 ## Running, resumption, budgets
 
-Each iteration of `ralph run` does: select next eligible task → pick persona → compose context → flip task to `in_progress` → invoke Kiro CLI → validate → process task creation → update status → commit. The loop stops when every task passes (exit 0), every non-passing task is stuck or blocked (exit 1), or a budget cap fires (exit 3).
+Each iteration of `ralph run` does: select next eligible task → pick persona → compose context → flip task to `in_progress` → invoke Claude Code CLI → validate → process task creation → update status → commit. The loop stops when every task passes (exit 0), every non-passing task is stuck or blocked (exit 1), or a budget cap fires (exit 3).
 
 Interrupting with `SIGTERM` or `Ctrl+C` is safe. On the next startup, any task still marked `in_progress` is reset to `failing` without incrementing `retry_count` (R14.3), and the next iteration is flagged `resumed_from_interruption` so the persona sees a resumed-from-interruption notice in its context (R14.5).
 
@@ -192,5 +192,16 @@ JSON Schemas for the core Pydantic models are exported to `schemas/` for editor 
 - `schemas/config.schema.json`
 
 Regenerate them from the current models with `python scripts/export_schemas.py`.
+
+## Claude Code CLI Integration
+
+This port uses Claude Code CLI (`claude -p`) in non-interactive mode with JSON output for structured token usage tracking. The invoker supports:
+
+- `--model <id>` for model selection (default: claude-opus-4.7)
+- `--max-turns N` for turn limits
+- `--allowedTools tool1,tool2` for tool restrictions
+- `--system-prompt "text"` for custom system prompts
+- `--output-format json` for structured output with token usage
+- `--dangerously-skip-permissions` to enable all tool use without approval
 
 See `.kiro/specs/ralph-loop/` for the full requirements, design, and task breakdown.
